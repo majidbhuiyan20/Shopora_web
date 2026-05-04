@@ -2,7 +2,15 @@
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { adminRequest, getAdminToken } from "../api/admin-client";
-import { createCategory, listCategories } from "../api/categories";
+import {
+  createCategory,
+  deleteCategory,
+  listCategories,
+  listDeletedCategories,
+  permanentlyDeleteCategory,
+  restoreCategory,
+  updateCategory,
+} from "../api/categories";
 import type {
   Category,
   Order,
@@ -22,6 +30,16 @@ const orderStatuses: OrderStatus[] = [
 ];
 
 type DashboardTab = "overview" | "categories" | "products" | "orders";
+type CategoryView = "active" | "deleted";
+
+const emptyCategoryForm = {
+  name: "",
+  description: "",
+  image_url: "",
+  icon_url: "",
+  display_order: "0",
+  is_active: true,
+};
 
 const emptyProductForm = {
   category_id: "",
@@ -37,14 +55,14 @@ const emptyProductForm = {
 export function AdminDashboard() {
   const [activeTab, setActiveTab] = useState<DashboardTab>("overview");
   const [categories, setCategories] = useState<Category[]>([]);
+  const [deletedCategories, setDeletedCategories] = useState<Category[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
   const [revenue, setRevenue] = useState<RevenueSummary | null>(null);
-  const [categoryForm, setCategoryForm] = useState({
-    name: "",
-    description: "",
-    display_order: "0",
-  });
+  const [categoryForm, setCategoryForm] = useState(emptyCategoryForm);
+  const [editingCategoryId, setEditingCategoryId] = useState<number | null>(
+    null,
+  );
   const [productForm, setProductForm] = useState(emptyProductForm);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
@@ -80,6 +98,11 @@ export function AdminDashboard() {
       setProducts(productRes.data?.products ?? []);
       setOrders(orderRes.data?.orders ?? []);
       setRevenue(revenueRes.data?.summary ?? null);
+      void listDeletedCategories()
+        .then((deletedRes) =>
+          setDeletedCategories(deletedRes.data?.categories ?? []),
+        )
+        .catch(() => setDeletedCategories([]));
     } catch (requestError) {
       setError(
         requestError instanceof Error
@@ -105,20 +128,32 @@ export function AdminDashboard() {
     void initializeDashboard();
   }, []);
 
-  async function handleCreateCategory(event: FormEvent<HTMLFormElement>) {
+  async function handleSubmitCategory(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setIsSaving(true);
     setNotice("");
     setError("");
 
     try {
-      await createCategory({
+      const payload = {
         name: categoryForm.name,
         description: categoryForm.description,
+        image_url: categoryForm.image_url,
+        icon_url: categoryForm.icon_url,
         display_order: Number(categoryForm.display_order || 0),
-      });
-      setNotice("Category created successfully.");
-      setCategoryForm({ name: "", description: "", display_order: "0" });
+        is_active: categoryForm.is_active,
+      };
+
+      if (editingCategoryId) {
+        await updateCategory(editingCategoryId, payload);
+        setNotice("Category updated successfully.");
+      } else {
+        await createCategory(payload);
+        setNotice("Category created successfully.");
+      }
+
+      setCategoryForm(emptyCategoryForm);
+      setEditingCategoryId(null);
       await loadDashboard();
     } catch (requestError) {
       setError(
@@ -128,6 +163,77 @@ export function AdminDashboard() {
       );
     } finally {
       setIsSaving(false);
+    }
+  }
+
+  function handleEditCategory(category: Category) {
+    setEditingCategoryId(category.id);
+    setCategoryForm({
+      name: category.name,
+      description: category.description ?? "",
+      image_url: category.image_url ?? "",
+      icon_url: category.icon_url ?? "",
+      display_order: String(category.display_order ?? 0),
+      is_active: category.is_active,
+    });
+    setActiveTab("categories");
+    setNotice("");
+    setError("");
+  }
+
+  function handleCancelCategoryEdit() {
+    setEditingCategoryId(null);
+    setCategoryForm(emptyCategoryForm);
+  }
+
+  async function handleDeleteCategory(id: number) {
+    setNotice("");
+    setError("");
+
+    try {
+      await deleteCategory(id);
+      setNotice("Category deleted successfully.");
+      await loadDashboard();
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : "Unable to delete category.",
+      );
+    }
+  }
+
+  async function handleRestoreCategory(id: number) {
+    setNotice("");
+    setError("");
+
+    try {
+      await restoreCategory(id);
+      setNotice("Category restored successfully.");
+      await loadDashboard();
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : "Unable to restore category.",
+      );
+    }
+  }
+
+  async function handlePermanentDeleteCategory(id: number) {
+    setNotice("");
+    setError("");
+
+    try {
+      await permanentlyDeleteCategory(id);
+      setNotice("Category permanently deleted.");
+      await loadDashboard();
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : "Unable to permanently delete category.",
+      );
     }
   }
 
@@ -262,10 +368,17 @@ export function AdminDashboard() {
         {!isLoading && activeTab === "categories" ? (
           <CategoriesPanel
             categories={categories}
+            deletedCategories={deletedCategories}
             form={categoryForm}
+            editingCategoryId={editingCategoryId}
             isSaving={isSaving}
             onChange={setCategoryForm}
-            onSubmit={handleCreateCategory}
+            onSubmit={handleSubmitCategory}
+            onCancelEdit={handleCancelCategoryEdit}
+            onEdit={handleEditCategory}
+            onDelete={handleDeleteCategory}
+            onRestore={handleRestoreCategory}
+            onPermanentDelete={handlePermanentDeleteCategory}
           />
         ) : null}
 
@@ -326,28 +439,75 @@ function Overview({
 
 function CategoriesPanel({
   categories,
+  deletedCategories,
   form,
+  editingCategoryId,
   isSaving,
   onChange,
   onSubmit,
+  onCancelEdit,
+  onEdit,
+  onDelete,
+  onRestore,
+  onPermanentDelete,
 }: {
   categories: Category[];
-  form: { name: string; description: string; display_order: string };
+  deletedCategories: Category[];
+  form: typeof emptyCategoryForm;
+  editingCategoryId: number | null;
   isSaving: boolean;
-  onChange: (value: {
-    name: string;
-    description: string;
-    display_order: string;
-  }) => void;
+  onChange: (value: typeof emptyCategoryForm) => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onCancelEdit: () => void;
+  onEdit: (category: Category) => void;
+  onDelete: (id: number) => void;
+  onRestore: (id: number) => void;
+  onPermanentDelete: (id: number) => void;
 }) {
+  const [categoryView, setCategoryView] = useState<CategoryView>("active");
+  const [openMenuId, setOpenMenuId] = useState<number | null>(null);
+  const visibleCategories =
+    categoryView === "active" ? categories : deletedCategories;
+
   return (
-    <section className="grid gap-5 lg:grid-cols-[0.78fr_1.22fr]">
+    <section className="grid gap-5 xl:grid-cols-[0.72fr_1.28fr]">
       <form
         onSubmit={onSubmit}
         className="rounded-2xl border border-[#d9e4dc] bg-white p-6 shadow-lg shadow-[#153820]/6"
       >
-        <h2 className="text-xl font-black text-ink">Add category</h2>
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h2 className="text-xl font-black text-ink">
+              {editingCategoryId ? "Edit category" : "Add category"}
+            </h2>
+            <p className="mt-1 text-sm leading-6 text-ink/55">
+              Add the category artwork URL so storefront lists can display a
+              polished visual card.
+            </p>
+          </div>
+          {editingCategoryId ? (
+            <button
+              type="button"
+              onClick={onCancelEdit}
+              className="h-9 rounded-lg border border-[#d9e4dc] px-3 text-xs font-black text-ink/65 transition hover:border-primary/40 hover:text-primary"
+            >
+              Cancel
+            </button>
+          ) : null}
+        </div>
+
+        {form.image_url ? (
+          <div
+            className="mt-5 aspect-[16/9] rounded-xl border border-[#d9e4dc] bg-cover bg-center"
+            style={{ backgroundImage: `url("${form.image_url}")` }}
+            aria-label="Category image preview"
+          />
+        ) : (
+          <div className="mt-5 flex aspect-[16/9] items-center justify-center rounded-xl border border-dashed border-[#c9d8ce] bg-primary-soft text-sm font-bold text-primary">
+            Image preview
+          </div>
+        )}
+
         <div className="mt-5 space-y-4">
           <TextInput
             label="Category name"
@@ -361,45 +521,229 @@ function CategoriesPanel({
             onChange={(value) => onChange({ ...form, description: value })}
           />
           <TextInput
+            label="Image URL"
+            value={form.image_url}
+            onChange={(value) => onChange({ ...form, image_url: value })}
+          />
+          <TextInput
+            label="Icon URL"
+            value={form.icon_url}
+            onChange={(value) => onChange({ ...form, icon_url: value })}
+          />
+          <TextInput
             label="Display order"
             type="number"
             value={form.display_order}
             onChange={(value) => onChange({ ...form, display_order: value })}
           />
+          <label className="flex items-center justify-between rounded-lg border border-[#d9e4dc] px-3 py-3 text-sm font-bold text-ink/75">
+            <span>Active category</span>
+            <input
+              type="checkbox"
+              checked={form.is_active}
+              onChange={(event) =>
+                onChange({ ...form, is_active: event.target.checked })
+              }
+              className="h-5 w-5 accent-[#0f7a3a]"
+            />
+          </label>
           <PrimaryButton disabled={isSaving}>
-            {isSaving ? "Saving..." : "Create category"}
+            {isSaving
+              ? "Saving..."
+              : editingCategoryId
+                ? "Update category"
+                : "Create category"}
           </PrimaryButton>
         </div>
       </form>
 
       <div className="rounded-2xl border border-[#d9e4dc] bg-white p-6 shadow-lg shadow-[#153820]/6">
-        <h2 className="text-xl font-black text-ink">Product categories</h2>
+        <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
+          <div>
+            <h2 className="text-xl font-black text-ink">Product categories</h2>
+            <p className="mt-1 text-sm text-ink/55">
+              Review category artwork, status, and operational actions.
+            </p>
+          </div>
+          <div className="grid grid-cols-2 rounded-lg border border-[#d9e4dc] bg-[#f7faf7] p-1 text-sm font-black">
+            {[
+              ["active", `Active ${categories.length}`],
+              ["deleted", `Deleted ${deletedCategories.length}`],
+            ].map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                onClick={() => {
+                  setCategoryView(value as CategoryView);
+                  setOpenMenuId(null);
+                }}
+                className={`h-9 rounded-md px-3 transition ${
+                  categoryView === value
+                    ? "bg-white text-primary shadow-sm"
+                    : "text-ink/55 hover:text-primary"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
         <div className="mt-5 overflow-hidden rounded-xl border border-[#e4ece6]">
           <table className="w-full text-left text-sm">
             <thead className="bg-primary-soft text-primary">
               <tr>
-                <th className="px-4 py-3">Name</th>
+                <th className="px-4 py-3">Category</th>
                 <th className="px-4 py-3">Slug</th>
                 <th className="px-4 py-3">Status</th>
+                <th className="px-4 py-3 text-right">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-[#e4ece6]">
-              {categories.map((category) => (
-                <tr key={category.id}>
-                  <td className="px-4 py-3 font-bold text-ink">
-                    {category.name}
+              {visibleCategories.map((category) => (
+                <tr key={category.id} className="align-middle">
+                  <td className="px-4 py-3">
+                    <div className="flex items-center gap-3">
+                      <CategoryArtwork category={category} />
+                      <div className="min-w-0">
+                        <p className="truncate font-black text-ink">
+                          {category.name}
+                        </p>
+                        <p className="line-clamp-1 text-xs text-ink/50">
+                          {category.description || "No description"}
+                        </p>
+                      </div>
+                    </div>
                   </td>
                   <td className="px-4 py-3 text-ink/60">{category.slug}</td>
-                  <td className="px-4 py-3 text-ink/60">
-                    {category.is_active ? "Active" : "Inactive"}
+                  <td className="px-4 py-3">
+                    <span
+                      className={`rounded-full px-3 py-1 text-xs font-black ${
+                        categoryView === "deleted"
+                          ? "bg-red-50 text-red-700"
+                          : category.is_active
+                            ? "bg-primary-soft text-primary"
+                            : "bg-zinc-100 text-zinc-600"
+                      }`}
+                    >
+                      {categoryView === "deleted"
+                        ? "Deleted"
+                        : category.is_active
+                          ? "Active"
+                          : "Inactive"}
+                    </span>
+                  </td>
+                  <td className="relative px-4 py-3 text-right">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setOpenMenuId((current) =>
+                          current === category.id ? null : category.id,
+                        )
+                      }
+                      className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-ink/55 transition hover:bg-primary-soft hover:text-primary"
+                      aria-label={`Open actions for ${category.name}`}
+                      title="Actions"
+                    >
+                      <span className="text-xl leading-none">...</span>
+                    </button>
+                    {openMenuId === category.id ? (
+                      <div className="absolute right-4 top-12 z-10 w-44 rounded-xl border border-[#d9e4dc] bg-white p-2 text-left shadow-xl shadow-[#153820]/12">
+                        {categoryView === "active" ? (
+                          <>
+                            <ActionMenuButton
+                              label="Edit category"
+                              onClick={() => {
+                                setOpenMenuId(null);
+                                onEdit(category);
+                              }}
+                            />
+                            <ActionMenuButton
+                              label="Delete category"
+                              destructive
+                              onClick={() => {
+                                setOpenMenuId(null);
+                                onDelete(category.id);
+                              }}
+                            />
+                          </>
+                        ) : (
+                          <>
+                            <ActionMenuButton
+                              label="Restore category"
+                              onClick={() => {
+                                setOpenMenuId(null);
+                                onRestore(category.id);
+                              }}
+                            />
+                            <ActionMenuButton
+                              label="Delete forever"
+                              destructive
+                              onClick={() => {
+                                setOpenMenuId(null);
+                                onPermanentDelete(category.id);
+                              }}
+                            />
+                          </>
+                        )}
+                      </div>
+                    ) : null}
                   </td>
                 </tr>
               ))}
+              {!visibleCategories.length ? (
+                <tr>
+                  <td className="px-4 py-8 text-center text-ink/55" colSpan={4}>
+                    No {categoryView} categories found.
+                  </td>
+                </tr>
+              ) : null}
             </tbody>
           </table>
         </div>
       </div>
     </section>
+  );
+}
+
+function CategoryArtwork({ category }: { category: Category }) {
+  if (category.image_url) {
+    return (
+      <div
+        className="h-14 w-14 shrink-0 rounded-xl border border-[#d9e4dc] bg-cover bg-center"
+        style={{ backgroundImage: `url("${category.image_url}")` }}
+        aria-label={`${category.name} image`}
+      />
+    );
+  }
+
+  return (
+    <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-xl border border-[#d9e4dc] bg-primary-soft text-lg font-black text-primary">
+      {category.name.slice(0, 1).toUpperCase()}
+    </div>
+  );
+}
+
+function ActionMenuButton({
+  label,
+  onClick,
+  destructive = false,
+}: {
+  label: string;
+  onClick: () => void;
+  destructive?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`block h-9 w-full rounded-lg px-3 text-left text-sm font-bold transition ${
+        destructive
+          ? "text-red-700 hover:bg-red-50"
+          : "text-ink/75 hover:bg-primary-soft hover:text-primary"
+      }`}
+    >
+      {label}
+    </button>
   );
 }
 
