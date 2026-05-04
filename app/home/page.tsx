@@ -1,5 +1,5 @@
-import { AdminDashboard } from "@/features/admin";
+import { AdminHomePage } from "@/features/admin";
 
 export default function HomePage() {
-  return <AdminDashboard />;
+  return <AdminHomePage />;
 }

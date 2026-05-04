@@ -1,7 +1,8 @@
 "use client";
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { adminRequest, getAdminToken } from "../api/admin-client";
+import { getRevenueSummary } from "../api/analytics";
+import { getAdminToken } from "../api/admin-client";
 import {
   createCategory,
   deleteCategory,
@@ -11,13 +12,13 @@ import {
   restoreCategory,
   updateCategory,
 } from "../api/categories";
+import { listOrders, updateOrderStatus } from "../api/orders";
+import { createProduct, listProducts } from "../api/products";
 import type {
   Category,
   Order,
-  OrderListData,
   OrderStatus,
   Product,
-  ProductListData,
   RevenueSummary,
 } from "../types";
 
@@ -29,7 +30,14 @@ const orderStatuses: OrderStatus[] = [
   "cancelled",
 ];
 
-type DashboardTab = "overview" | "categories" | "products" | "orders";
+const navigationItems = [
+  { value: "overview", label: "Overview", helper: "Snapshot" },
+  { value: "categories", label: "Categories", helper: "Taxonomy" },
+  { value: "products", label: "Products", helper: "Inventory" },
+  { value: "orders", label: "Orders", helper: "Tracking" },
+] as const;
+
+type DashboardTab = (typeof navigationItems)[number]["value"];
 type CategoryView = "active" | "deleted";
 
 const emptyCategoryForm = {
@@ -68,41 +76,47 @@ export function AdminDashboard() {
   const [error, setError] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
+  const [isCategoryDialogOpen, setIsCategoryDialogOpen] = useState(false);
+  const [isProductDialogOpen, setIsProductDialogOpen] = useState(false);
 
   const stats = useMemo(
     () => [
-      { label: "Categories", value: categories.length },
-      { label: "Products", value: products.length },
-      { label: "Orders", value: orders.length },
+      { label: "Categories", value: categories.length, tone: "green" },
+      { label: "Products", value: products.length, tone: "ink" },
+      { label: "Orders", value: orders.length, tone: "gold" },
       {
         label: "Revenue",
         value: currency(revenue?.total_revenue ?? revenue?.revenue ?? 0),
+        tone: "green",
       },
     ],
     [categories.length, orders.length, products.length, revenue],
   );
+
+  const lowStockCount = products.filter((product) => product.quantity <= 10)
+    .length;
+  const pendingOrderCount = orders.filter((order) => order.status === "pending")
+    .length;
 
   async function loadDashboard() {
     setIsLoading(true);
     setError("");
 
     try {
-      const [categoryRes, productRes, orderRes, revenueRes] = await Promise.all([
-        listCategories(),
-        adminRequest<ProductListData>("products"),
-        adminRequest<OrderListData>("orders"),
-        adminRequest<{ summary: RevenueSummary }>("analytics/revenue"),
-      ]);
+      const [categoryRes, deletedRes, productRes, orderRes, revenueRes] =
+        await Promise.all([
+          listCategories(),
+          listDeletedCategories().catch(() => ({ data: { categories: [] } })),
+          listProducts(),
+          listOrders(),
+          getRevenueSummary(),
+        ]);
 
       setCategories(categoryRes.data?.categories ?? []);
+      setDeletedCategories(deletedRes.data?.categories ?? []);
       setProducts(productRes.data?.products ?? []);
       setOrders(orderRes.data?.orders ?? []);
       setRevenue(revenueRes.data?.summary ?? null);
-      void listDeletedCategories()
-        .then((deletedRes) =>
-          setDeletedCategories(deletedRes.data?.categories ?? []),
-        )
-        .catch(() => setDeletedCategories([]));
     } catch (requestError) {
       setError(
         requestError instanceof Error
@@ -128,6 +142,39 @@ export function AdminDashboard() {
     void initializeDashboard();
   }, []);
 
+  function openCreateCategoryDialog() {
+    setEditingCategoryId(null);
+    setCategoryForm(emptyCategoryForm);
+    setIsCategoryDialogOpen(true);
+  }
+
+  function openEditCategoryDialog(category: Category) {
+    setEditingCategoryId(category.id);
+    setCategoryForm({
+      name: category.name,
+      description: category.description ?? "",
+      image_url: category.image_url ?? "",
+      icon_url: category.icon_url ?? "",
+      display_order: String(category.display_order ?? 0),
+      is_active: category.is_active,
+    });
+    setIsCategoryDialogOpen(true);
+    setActiveTab("categories");
+    setNotice("");
+    setError("");
+  }
+
+  function closeCategoryDialog() {
+    setIsCategoryDialogOpen(false);
+    setEditingCategoryId(null);
+    setCategoryForm(emptyCategoryForm);
+  }
+
+  function openProductDialog() {
+    setProductForm(emptyProductForm);
+    setIsProductDialogOpen(true);
+  }
+
   async function handleSubmitCategory(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setIsSaving(true);
@@ -152,38 +199,17 @@ export function AdminDashboard() {
         setNotice("Category created successfully.");
       }
 
-      setCategoryForm(emptyCategoryForm);
-      setEditingCategoryId(null);
+      closeCategoryDialog();
       await loadDashboard();
     } catch (requestError) {
       setError(
         requestError instanceof Error
           ? requestError.message
-          : "Unable to create category.",
+          : "Unable to save category.",
       );
     } finally {
       setIsSaving(false);
     }
-  }
-
-  function handleEditCategory(category: Category) {
-    setEditingCategoryId(category.id);
-    setCategoryForm({
-      name: category.name,
-      description: category.description ?? "",
-      image_url: category.image_url ?? "",
-      icon_url: category.icon_url ?? "",
-      display_order: String(category.display_order ?? 0),
-      is_active: category.is_active,
-    });
-    setActiveTab("categories");
-    setNotice("");
-    setError("");
-  }
-
-  function handleCancelCategoryEdit() {
-    setEditingCategoryId(null);
-    setCategoryForm(emptyCategoryForm);
   }
 
   async function handleDeleteCategory(id: number) {
@@ -244,22 +270,20 @@ export function AdminDashboard() {
     setError("");
 
     try {
-      await adminRequest("products", {
-        method: "POST",
-        body: JSON.stringify({
-          category_id: Number(productForm.category_id),
-          sku: productForm.sku,
-          title: productForm.title,
-          short_description: productForm.short_description,
-          description: productForm.description,
-          price: Number(productForm.price),
-          quantity: Number(productForm.quantity || 0),
-          low_stock_warning: 10,
-          thumbnail_url: productForm.thumbnail_url,
-        }),
+      await createProduct({
+        category_id: Number(productForm.category_id),
+        sku: productForm.sku,
+        title: productForm.title,
+        short_description: productForm.short_description,
+        description: productForm.description,
+        price: Number(productForm.price),
+        quantity: Number(productForm.quantity || 0),
+        low_stock_warning: 10,
+        thumbnail_url: productForm.thumbnail_url,
       });
       setNotice("Product created successfully.");
       setProductForm(emptyProductForm);
+      setIsProductDialogOpen(false);
       await loadDashboard();
     } catch (requestError) {
       setError(
@@ -277,13 +301,7 @@ export function AdminDashboard() {
     setError("");
 
     try {
-      await adminRequest(`orders/${orderID}/status`, {
-        method: "PUT",
-        body: JSON.stringify({
-          status,
-          note: `Admin marked order as ${status}.`,
-        }),
-      });
+      await updateOrderStatus(orderID, status, `Admin marked order as ${status}.`);
       setNotice(`Order #${orderID} updated to ${status}.`);
       await loadDashboard();
     } catch (requestError) {
@@ -296,111 +314,294 @@ export function AdminDashboard() {
   }
 
   return (
-    <main className="min-h-screen bg-[#f5f8f4]">
-      <div className="mx-auto flex w-full max-w-7xl flex-col gap-8 px-5 py-6 sm:px-8">
-        <header className="flex flex-col justify-between gap-5 rounded-2xl border border-[#d9e4dc] bg-white p-6 shadow-xl shadow-[#153820]/8 md:flex-row md:items-center">
-          <div>
-            <p className="mb-2 text-sm font-bold uppercase tracking-[0.18em] text-primary">
-              Shopora Admin
-            </p>
-            <h1 className="text-3xl font-black text-ink sm:text-4xl">
-              Dashboard
-            </h1>
-            <p className="mt-2 max-w-2xl text-sm leading-6 text-ink/60">
-              Manage categories, publish products, view product-category
-              inventory, and track customer orders from one workspace.
-            </p>
+    <main className="min-h-screen bg-[#edf0f3] text-ink">
+      <div className="flex min-h-screen">
+        <Sidebar activeTab={activeTab} onChange={setActiveTab} />
+
+        <section className="min-w-0 flex-1">
+          <div className="mx-auto flex w-full max-w-[1600px] flex-col gap-6 px-4 py-4 sm:px-6 lg:px-7">
+            <DashboardHeader
+              activeTab={activeTab}
+              lowStockCount={lowStockCount}
+              pendingOrderCount={pendingOrderCount}
+              onRefresh={loadDashboard}
+              onCreateCategory={() => {
+                setActiveTab("categories");
+                openCreateCategoryDialog();
+              }}
+              onCreateProduct={() => {
+                setActiveTab("products");
+                openProductDialog();
+              }}
+            />
+
+            {notice ? <Notice tone="success">{notice}</Notice> : null}
+            {error ? <Notice tone="error">{error}</Notice> : null}
+
+            {isLoading ? (
+              <Panel>
+                <p className="text-sm font-bold text-ink/55">
+                  Loading dashboard...
+                </p>
+              </Panel>
+            ) : null}
+
+            {!isLoading && activeTab === "overview" ? (
+              <Overview stats={stats} products={products} orders={orders} />
+            ) : null}
+
+            {!isLoading && activeTab === "categories" ? (
+              <CategoriesPanel
+                categories={categories}
+                deletedCategories={deletedCategories}
+                onCreate={openCreateCategoryDialog}
+                onEdit={openEditCategoryDialog}
+                onDelete={handleDeleteCategory}
+                onRestore={handleRestoreCategory}
+                onPermanentDelete={handlePermanentDeleteCategory}
+              />
+            ) : null}
+
+            {!isLoading && activeTab === "products" ? (
+              <ProductsPanel
+                categories={categories}
+                products={products}
+                onCreate={openProductDialog}
+              />
+            ) : null}
+
+            {!isLoading && activeTab === "orders" ? (
+              <OrdersPanel
+                orders={orders}
+                onUpdateStatus={handleUpdateOrderStatus}
+              />
+            ) : null}
           </div>
+        </section>
+      </div>
 
-          <button
-            type="button"
-            onClick={loadDashboard}
-            className="h-11 rounded-lg border border-primary/20 px-5 text-sm font-bold text-primary transition hover:bg-primary-soft"
-          >
-            Refresh
-          </button>
-        </header>
+      <CategoryDialog
+        form={categoryForm}
+        isOpen={isCategoryDialogOpen}
+        isSaving={isSaving}
+        isEditing={Boolean(editingCategoryId)}
+        onChange={setCategoryForm}
+        onClose={closeCategoryDialog}
+        onSubmit={handleSubmitCategory}
+      />
 
-        <nav className="grid gap-3 sm:grid-cols-4">
-          {[
-            ["overview", "Overview"],
-            ["categories", "Categories"],
-            ["products", "Products"],
-            ["orders", "Orders"],
-          ].map(([value, label]) => (
+      <ProductDialog
+        categories={categories}
+        form={productForm}
+        isOpen={isProductDialogOpen}
+        isSaving={isSaving}
+        onChange={setProductForm}
+        onClose={() => setIsProductDialogOpen(false)}
+        onSubmit={handleCreateProduct}
+      />
+    </main>
+  );
+}
+
+function Sidebar({
+  activeTab,
+  onChange,
+}: {
+  activeTab: DashboardTab;
+  onChange: (tab: DashboardTab) => void;
+}) {
+  return (
+    <aside className="sticky top-0 hidden h-screen w-80 shrink-0 border-r border-[#dde2e8] bg-white text-[#5f6368] shadow-[8px_0_24px_rgba(20,30,40,0.04)] lg:block">
+      <div className="flex h-full flex-col">
+        <div className="border-b border-[#eef1f4] px-5 py-6">
+          <div className="flex items-center gap-3">
+            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-[#eef7ff] text-xl font-black text-[#0788ff]">
+              S
+            </div>
+            <div>
+              <p className="text-2xl font-semibold tracking-normal text-[#2f3338]">
+                Shopora
+              </p>
+              <p className="text-xs font-bold uppercase tracking-[0.16em] text-[#a7adb5]">
+                Admin Suite
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <nav className="space-y-1 px-3 py-5">
+          {navigationItems.map((item) => (
             <button
-              key={value}
+              key={item.value}
               type="button"
-              onClick={() => setActiveTab(value as DashboardTab)}
-              className={`h-11 rounded-lg border px-4 text-sm font-bold transition ${
-                activeTab === value
-                  ? "border-primary bg-primary text-white"
-                  : "border-[#d9e4dc] bg-white text-ink/70 hover:border-primary/35 hover:text-primary"
+              onClick={() => onChange(item.value)}
+              className={`flex w-full items-center justify-between rounded-md px-5 py-3 text-left transition ${
+                activeTab === item.value
+                  ? "bg-[#edf6ff] text-[#0788ff]"
+                  : "text-[#666a70] hover:bg-[#f5f8fb] hover:text-[#0788ff]"
               }`}
             >
-              {label}
+              <span className="flex items-center gap-3">
+                <span className="flex h-7 w-7 items-center justify-center rounded-md border border-current/15 text-xs font-black">
+                  {item.label.slice(0, 1)}
+                </span>
+                <span>
+                  <span className="block text-base font-medium">
+                    {item.label}
+                  </span>
+                  <span className="mt-0.5 block text-xs font-medium opacity-60">
+                    {item.helper}
+                  </span>
+                </span>
+              </span>
+              <span className="text-lg opacity-70">&gt;</span>
             </button>
           ))}
         </nav>
 
-        {notice ? (
-          <p className="rounded-lg bg-primary-soft px-4 py-3 text-sm font-bold text-primary">
-            {notice}
+        <div className="mt-4 px-8">
+          <p className="mb-3 text-xs font-bold uppercase tracking-[0.14em] text-[#a7adb5]">
+            Commerce
           </p>
-        ) : null}
-
-        {error ? (
-          <p className="rounded-lg bg-red-50 px-4 py-3 text-sm font-bold text-red-700">
-            {error}
-          </p>
-        ) : null}
-
-        {isLoading ? (
-          <div className="rounded-2xl border border-[#d9e4dc] bg-white p-8 text-sm font-bold text-ink/60">
-            Loading dashboard...
+          <div className="space-y-3 text-sm font-medium text-[#747980]">
+            <p>Catalog operations</p>
+            <p>Order fulfillment</p>
+            <p>Revenue tracking</p>
           </div>
-        ) : null}
+        </div>
 
-        {!isLoading && activeTab === "overview" ? (
-          <Overview stats={stats} products={products} orders={orders} />
-        ) : null}
-
-        {!isLoading && activeTab === "categories" ? (
-          <CategoriesPanel
-            categories={categories}
-            deletedCategories={deletedCategories}
-            form={categoryForm}
-            editingCategoryId={editingCategoryId}
-            isSaving={isSaving}
-            onChange={setCategoryForm}
-            onSubmit={handleSubmitCategory}
-            onCancelEdit={handleCancelCategoryEdit}
-            onEdit={handleEditCategory}
-            onDelete={handleDeleteCategory}
-            onRestore={handleRestoreCategory}
-            onPermanentDelete={handlePermanentDeleteCategory}
-          />
-        ) : null}
-
-        {!isLoading && activeTab === "products" ? (
-          <ProductsPanel
-            categories={categories}
-            form={productForm}
-            products={products}
-            isSaving={isSaving}
-            onChange={setProductForm}
-            onSubmit={handleCreateProduct}
-          />
-        ) : null}
-
-        {!isLoading && activeTab === "orders" ? (
-          <OrdersPanel
-            orders={orders}
-            onUpdateStatus={handleUpdateOrderStatus}
-          />
-        ) : null}
+        <div className="mt-auto border-t border-[#eef1f4] p-5">
+          <div className="grid grid-cols-3 gap-3 text-center text-xl">
+            <button className="rounded-lg bg-[#f4f7fa] py-2" type="button">
+              D
+            </button>
+            <button className="rounded-lg bg-[#f4f7fa] py-2" type="button">
+              L
+            </button>
+            <button className="rounded-lg bg-[#f4f7fa] py-2" type="button">
+              i
+            </button>
+          </div>
+        </div>
       </div>
-    </main>
+    </aside>
+  );
+}
+
+function DashboardHeader({
+  activeTab,
+  lowStockCount,
+  pendingOrderCount,
+  onRefresh,
+  onCreateCategory,
+  onCreateProduct,
+}: {
+  activeTab: DashboardTab;
+  lowStockCount: number;
+  pendingOrderCount: number;
+  onRefresh: () => void;
+  onCreateCategory: () => void;
+  onCreateProduct: () => void;
+}) {
+  const title = navigationItems.find((item) => item.value === activeTab)?.label;
+
+  return (
+    <header className="space-y-5">
+      <div className="flex min-h-20 items-center gap-4 rounded-2xl border border-[#dde2e8] bg-white px-4 py-3 shadow-[0_10px_24px_rgba(20,30,40,0.06)]">
+        <button
+          type="button"
+          className="flex h-11 w-11 items-center justify-center rounded-lg text-2xl font-medium text-[#44484d] hover:bg-[#f4f7fa]"
+          aria-label="Open menu"
+          title="Menu"
+        >
+          =
+        </button>
+        <label className="relative hidden h-12 flex-1 items-center md:flex">
+          <span className="absolute left-5 text-lg font-black text-[#777c82]">
+            /
+          </span>
+          <input
+            type="search"
+            placeholder="Search"
+            className="h-12 w-full rounded-full border border-[#d9dee6] bg-white pl-14 pr-5 text-base text-ink outline-none transition placeholder:text-[#9aa1aa] focus:border-[#0788ff] focus:ring-4 focus:ring-[#0788ff]/10"
+          />
+        </label>
+
+        <div className="ml-auto flex items-center gap-2 sm:gap-4">
+          <TopIcon label="Tasks" badge={lowStockCount} icon="V" />
+          <TopIcon label="Apps" icon="#" />
+          <TopIcon label="Orders" badge={pendingOrderCount} icon="!" />
+          <div className="flex h-12 w-12 items-center justify-center rounded-full border border-[#d9dee6] bg-[#f5f8fb] text-sm font-black text-primary">
+            SA
+          </div>
+        </div>
+      </div>
+
+      <div className="grid gap-5 xl:grid-cols-[1fr_auto]">
+        <div className="rounded-2xl border border-[#dde2e8] bg-white p-6 shadow-[0_10px_24px_rgba(20,30,40,0.06)]">
+          <p className="mb-2 text-sm font-black uppercase tracking-[0.18em] text-[#0788ff]">
+            Shopora Admin
+          </p>
+          <h1 className="text-3xl font-semibold tracking-normal text-[#2f3338] sm:text-4xl">
+            {title}
+          </h1>
+          <p className="mt-3 max-w-2xl text-sm leading-6 text-[#666a70]">
+            A clean commerce command center for categories, products, orders,
+            and revenue tracking.
+          </p>
+        </div>
+
+        <div className="grid gap-3 rounded-2xl border border-[#dde2e8] bg-white p-5 shadow-[0_10px_24px_rgba(20,30,40,0.06)] sm:grid-cols-3 xl:min-w-[480px]">
+          <button
+            type="button"
+            onClick={onCreateCategory}
+            className="h-12 rounded-lg bg-[#0788ff] px-4 text-sm font-black text-white shadow-lg shadow-[#0788ff]/20 transition hover:bg-[#0574da]"
+          >
+            Add category
+          </button>
+          <button
+            type="button"
+            onClick={onCreateProduct}
+            className="h-12 rounded-lg border border-[#0788ff]/20 bg-[#eef7ff] px-4 text-sm font-black text-[#0788ff] transition hover:bg-[#e1f0ff]"
+          >
+            Add product
+          </button>
+          <button
+            type="button"
+            onClick={onRefresh}
+            className="h-12 rounded-lg border border-[#d9dee6] bg-white px-4 text-sm font-black text-[#666a70] transition hover:border-[#0788ff]/35 hover:text-[#0788ff]"
+          >
+            Refresh
+          </button>
+        </div>
+      </div>
+    </header>
+  );
+}
+
+function TopIcon({
+  label,
+  icon,
+  badge,
+}: {
+  label: string;
+  icon: string;
+  badge?: number;
+}) {
+  return (
+    <button
+      type="button"
+      className="relative flex h-11 w-11 items-center justify-center rounded-lg text-xl font-black text-[#44484d] hover:bg-[#f4f7fa]"
+      aria-label={label}
+      title={label}
+    >
+      {icon}
+      {badge ? (
+        <span className="absolute -right-1 -top-1 flex h-6 min-w-6 items-center justify-center rounded-full bg-red-500 px-1 text-xs font-black text-white">
+          {badge}
+        </span>
+      ) : null}
+    </button>
   );
 }
 
@@ -409,28 +610,47 @@ function Overview({
   products,
   orders,
 }: {
-  stats: { label: string; value: number | string }[];
+  stats: { label: string; value: number | string; tone: string }[];
   products: Product[];
   orders: Order[];
 }) {
   return (
     <section className="grid gap-5">
-      <div className="grid gap-5 md:grid-cols-4">
-        {stats.map((item) => (
+      <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-4">
+        {stats.map((item, index) => (
           <div
             key={item.label}
-            className="rounded-xl border border-[#d9e4dc] bg-white p-6 shadow-lg shadow-[#153820]/6"
+            className="rounded-2xl border border-[#dde2e8] bg-white p-6 shadow-[0_10px_24px_rgba(20,30,40,0.06)]"
           >
-            <p className="text-sm font-bold text-ink/55">{item.label}</p>
-            <p className="mt-4 text-3xl font-black text-primary">
-              {item.value}
-            </p>
+            <div className="flex items-center gap-4">
+              <div
+                className={`flex h-14 w-14 items-center justify-center rounded-full text-xl font-black ${
+                  index === 0
+                    ? "bg-[#e8f1ff] text-[#1677ff]"
+                    : index === 1
+                      ? "bg-[#dcf8ec] text-[#00b976]"
+                      : index === 2
+                        ? "bg-[#ffe7f0] text-[#ff2f75]"
+                        : "bg-[#def8ff] text-[#00a5c7]"
+                }`}
+              >
+                {item.label.slice(0, 1)}
+              </div>
+              <div>
+                <p className="text-3xl font-semibold text-[#34383d]">
+                  {item.value}
+                </p>
+                <p className="mt-2 text-base font-medium text-[#6d5860]">
+                  {item.label}
+                </p>
+              </div>
+            </div>
           </div>
         ))}
       </div>
 
-      <div className="grid gap-5 lg:grid-cols-2">
-        <ProductCategoryList products={products} />
+      <div className="grid gap-5 xl:grid-cols-[1.05fr_0.95fr]">
+        <ProductTable products={products.slice(0, 6)} compact />
         <OrderTracker orders={orders} onUpdateStatus={null} compact />
       </div>
     </section>
@@ -440,12 +660,7 @@ function Overview({
 function CategoriesPanel({
   categories,
   deletedCategories,
-  form,
-  editingCategoryId,
-  isSaving,
-  onChange,
-  onSubmit,
-  onCancelEdit,
+  onCreate,
   onEdit,
   onDelete,
   onRestore,
@@ -453,12 +668,7 @@ function CategoriesPanel({
 }: {
   categories: Category[];
   deletedCategories: Category[];
-  form: typeof emptyCategoryForm;
-  editingCategoryId: number | null;
-  isSaving: boolean;
-  onChange: (value: typeof emptyCategoryForm) => void;
-  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
-  onCancelEdit: () => void;
+  onCreate: () => void;
   onEdit: (category: Category) => void;
   onDelete: (id: number) => void;
   onRestore: (id: number) => void;
@@ -470,101 +680,22 @@ function CategoriesPanel({
     categoryView === "active" ? categories : deletedCategories;
 
   return (
-    <section className="grid gap-5 xl:grid-cols-[0.72fr_1.28fr]">
-      <form
-        onSubmit={onSubmit}
-        className="rounded-2xl border border-[#d9e4dc] bg-white p-6 shadow-lg shadow-[#153820]/6"
-      >
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            <h2 className="text-xl font-black text-ink">
-              {editingCategoryId ? "Edit category" : "Add category"}
-            </h2>
-            <p className="mt-1 text-sm leading-6 text-ink/55">
-              Add the category artwork URL so storefront lists can display a
-              polished visual card.
-            </p>
-          </div>
-          {editingCategoryId ? (
-            <button
-              type="button"
-              onClick={onCancelEdit}
-              className="h-9 rounded-lg border border-[#d9e4dc] px-3 text-xs font-black text-ink/65 transition hover:border-primary/40 hover:text-primary"
-            >
-              Cancel
-            </button>
-          ) : null}
+    <Panel>
+      <div className="flex flex-col justify-between gap-4 md:flex-row md:items-center">
+        <div>
+          <p className="text-sm font-black uppercase tracking-[0.16em] text-primary">
+            Category Manager
+          </p>
+          <h2 className="mt-2 text-2xl font-black text-ink">
+            Product categories
+          </h2>
+          <p className="mt-2 max-w-2xl text-sm leading-6 text-ink/55">
+            Keep the storefront taxonomy tidy with imagery, active states, and
+            recovery tools for deleted categories.
+          </p>
         </div>
 
-        {form.image_url ? (
-          <div
-            className="mt-5 aspect-[16/9] rounded-xl border border-[#d9e4dc] bg-cover bg-center"
-            style={{ backgroundImage: `url("${form.image_url}")` }}
-            aria-label="Category image preview"
-          />
-        ) : (
-          <div className="mt-5 flex aspect-[16/9] items-center justify-center rounded-xl border border-dashed border-[#c9d8ce] bg-primary-soft text-sm font-bold text-primary">
-            Image preview
-          </div>
-        )}
-
-        <div className="mt-5 space-y-4">
-          <TextInput
-            label="Category name"
-            value={form.name}
-            onChange={(value) => onChange({ ...form, name: value })}
-            required
-          />
-          <TextArea
-            label="Description"
-            value={form.description}
-            onChange={(value) => onChange({ ...form, description: value })}
-          />
-          <TextInput
-            label="Image URL"
-            value={form.image_url}
-            onChange={(value) => onChange({ ...form, image_url: value })}
-          />
-          <TextInput
-            label="Icon URL"
-            value={form.icon_url}
-            onChange={(value) => onChange({ ...form, icon_url: value })}
-          />
-          <TextInput
-            label="Display order"
-            type="number"
-            value={form.display_order}
-            onChange={(value) => onChange({ ...form, display_order: value })}
-          />
-          <label className="flex items-center justify-between rounded-lg border border-[#d9e4dc] px-3 py-3 text-sm font-bold text-ink/75">
-            <span>Active category</span>
-            <input
-              type="checkbox"
-              checked={form.is_active}
-              onChange={(event) =>
-                onChange({ ...form, is_active: event.target.checked })
-              }
-              className="h-5 w-5 accent-[#0f7a3a]"
-            />
-          </label>
-          <PrimaryButton disabled={isSaving}>
-            {isSaving
-              ? "Saving..."
-              : editingCategoryId
-                ? "Update category"
-                : "Create category"}
-          </PrimaryButton>
-        </div>
-      </form>
-
-      <div className="rounded-2xl border border-[#d9e4dc] bg-white p-6 shadow-lg shadow-[#153820]/6">
-        <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
-          <div>
-            <h2 className="text-xl font-black text-ink">Product categories</h2>
-            <p className="mt-1 text-sm text-ink/55">
-              Review category artwork, status, and operational actions.
-            </p>
-          </div>
+        <div className="flex flex-col gap-3 sm:flex-row">
           <div className="grid grid-cols-2 rounded-lg border border-[#d9e4dc] bg-[#f7faf7] p-1 text-sm font-black">
             {[
               ["active", `Active ${categories.length}`],
@@ -577,7 +708,7 @@ function CategoriesPanel({
                   setCategoryView(value as CategoryView);
                   setOpenMenuId(null);
                 }}
-                className={`h-9 rounded-md px-3 transition ${
+                className={`h-10 rounded-md px-4 transition ${
                   categoryView === value
                     ? "bg-white text-primary shadow-sm"
                     : "text-ink/55 hover:text-primary"
@@ -587,189 +718,286 @@ function CategoriesPanel({
               </button>
             ))}
           </div>
-        </div>
-        <div className="mt-5 overflow-hidden rounded-xl border border-[#e4ece6]">
-          <table className="w-full text-left text-sm">
-            <thead className="bg-primary-soft text-primary">
-              <tr>
-                <th className="px-4 py-3">Category</th>
-                <th className="px-4 py-3">Slug</th>
-                <th className="px-4 py-3">Status</th>
-                <th className="px-4 py-3 text-right">Actions</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-[#e4ece6]">
-              {visibleCategories.map((category) => (
-                <tr key={category.id} className="align-middle">
-                  <td className="px-4 py-3">
-                    <div className="flex items-center gap-3">
-                      <CategoryArtwork category={category} />
-                      <div className="min-w-0">
-                        <p className="truncate font-black text-ink">
-                          {category.name}
-                        </p>
-                        <p className="line-clamp-1 text-xs text-ink/50">
-                          {category.description || "No description"}
-                        </p>
-                      </div>
-                    </div>
-                  </td>
-                  <td className="px-4 py-3 text-ink/60">{category.slug}</td>
-                  <td className="px-4 py-3">
-                    <span
-                      className={`rounded-full px-3 py-1 text-xs font-black ${
-                        categoryView === "deleted"
-                          ? "bg-red-50 text-red-700"
-                          : category.is_active
-                            ? "bg-primary-soft text-primary"
-                            : "bg-zinc-100 text-zinc-600"
-                      }`}
-                    >
-                      {categoryView === "deleted"
-                        ? "Deleted"
-                        : category.is_active
-                          ? "Active"
-                          : "Inactive"}
-                    </span>
-                  </td>
-                  <td className="relative px-4 py-3 text-right">
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setOpenMenuId((current) =>
-                          current === category.id ? null : category.id,
-                        )
-                      }
-                      className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-ink/55 transition hover:bg-primary-soft hover:text-primary"
-                      aria-label={`Open actions for ${category.name}`}
-                      title="Actions"
-                    >
-                      <span className="text-xl leading-none">...</span>
-                    </button>
-                    {openMenuId === category.id ? (
-                      <div className="absolute right-4 top-12 z-10 w-44 rounded-xl border border-[#d9e4dc] bg-white p-2 text-left shadow-xl shadow-[#153820]/12">
-                        {categoryView === "active" ? (
-                          <>
-                            <ActionMenuButton
-                              label="Edit category"
-                              onClick={() => {
-                                setOpenMenuId(null);
-                                onEdit(category);
-                              }}
-                            />
-                            <ActionMenuButton
-                              label="Delete category"
-                              destructive
-                              onClick={() => {
-                                setOpenMenuId(null);
-                                onDelete(category.id);
-                              }}
-                            />
-                          </>
-                        ) : (
-                          <>
-                            <ActionMenuButton
-                              label="Restore category"
-                              onClick={() => {
-                                setOpenMenuId(null);
-                                onRestore(category.id);
-                              }}
-                            />
-                            <ActionMenuButton
-                              label="Delete forever"
-                              destructive
-                              onClick={() => {
-                                setOpenMenuId(null);
-                                onPermanentDelete(category.id);
-                              }}
-                            />
-                          </>
-                        )}
-                      </div>
-                    ) : null}
-                  </td>
-                </tr>
-              ))}
-              {!visibleCategories.length ? (
-                <tr>
-                  <td className="px-4 py-8 text-center text-ink/55" colSpan={4}>
-                    No {categoryView} categories found.
-                  </td>
-                </tr>
-              ) : null}
-            </tbody>
-          </table>
+          <button
+            type="button"
+            onClick={onCreate}
+            className="h-12 rounded-lg bg-primary px-5 text-sm font-black text-white shadow-lg shadow-primary/20 transition hover:bg-[#0b6830]"
+          >
+            Add category
+          </button>
         </div>
       </div>
-    </section>
-  );
-}
 
-function CategoryArtwork({ category }: { category: Category }) {
-  if (category.image_url) {
-    return (
-      <div
-        className="h-14 w-14 shrink-0 rounded-xl border border-[#d9e4dc] bg-cover bg-center"
-        style={{ backgroundImage: `url("${category.image_url}")` }}
-        aria-label={`${category.name} image`}
-      />
-    );
-  }
+      <div className="mt-6 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+        {visibleCategories.map((category) => (
+          <article
+            key={category.id}
+            className="group relative overflow-visible rounded-2xl border border-[#d9e4dc] bg-white shadow-lg shadow-[#153820]/5 transition hover:-translate-y-0.5 hover:shadow-2xl hover:shadow-[#153820]/10"
+          >
+            <CategoryHero category={category} />
+            <div className="p-5">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <h3 className="truncate text-lg font-black text-ink">
+                    {category.name}
+                  </h3>
+                  <p className="mt-1 truncate text-xs font-bold text-ink/45">
+                    /{category.slug}
+                  </p>
+                </div>
+                <CategoryActions
+                  category={category}
+                  categoryView={categoryView}
+                  isOpen={openMenuId === category.id}
+                  onToggle={() =>
+                    setOpenMenuId((current) =>
+                      current === category.id ? null : category.id,
+                    )
+                  }
+                  onEdit={() => {
+                    setOpenMenuId(null);
+                    onEdit(category);
+                  }}
+                  onDelete={() => {
+                    setOpenMenuId(null);
+                    onDelete(category.id);
+                  }}
+                  onRestore={() => {
+                    setOpenMenuId(null);
+                    onRestore(category.id);
+                  }}
+                  onPermanentDelete={() => {
+                    setOpenMenuId(null);
+                    onPermanentDelete(category.id);
+                  }}
+                />
+              </div>
 
-  return (
-    <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-xl border border-[#d9e4dc] bg-primary-soft text-lg font-black text-primary">
-      {category.name.slice(0, 1).toUpperCase()}
-    </div>
-  );
-}
+              <p className="mt-3 line-clamp-2 min-h-10 text-sm leading-5 text-ink/58">
+                {category.description || "No description added yet."}
+              </p>
 
-function ActionMenuButton({
-  label,
-  onClick,
-  destructive = false,
-}: {
-  label: string;
-  onClick: () => void;
-  destructive?: boolean;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`block h-9 w-full rounded-lg px-3 text-left text-sm font-bold transition ${
-        destructive
-          ? "text-red-700 hover:bg-red-50"
-          : "text-ink/75 hover:bg-primary-soft hover:text-primary"
-      }`}
-    >
-      {label}
-    </button>
+              <div className="mt-5 flex items-center justify-between">
+                <StatusPill
+                  label={
+                    categoryView === "deleted"
+                      ? "Deleted"
+                      : category.is_active
+                        ? "Active"
+                        : "Inactive"
+                  }
+                  tone={
+                    categoryView === "deleted"
+                      ? "danger"
+                      : category.is_active
+                        ? "success"
+                        : "muted"
+                  }
+                />
+                <span className="text-xs font-black text-ink/40">
+                  Order {category.display_order}
+                </span>
+              </div>
+            </div>
+          </article>
+        ))}
+
+        {!visibleCategories.length ? (
+          <div className="rounded-2xl border border-dashed border-[#c9d8ce] bg-[#f7faf7] p-8 text-center md:col-span-2 xl:col-span-3">
+            <p className="text-lg font-black text-ink">No categories found</p>
+            <p className="mt-2 text-sm text-ink/55">
+              Create your first category with polished artwork.
+            </p>
+          </div>
+        ) : null}
+      </div>
+    </Panel>
   );
 }
 
 function ProductsPanel({
   categories,
-  form,
   products,
+  onCreate,
+}: {
+  categories: Category[];
+  products: Product[];
+  onCreate: () => void;
+}) {
+  return (
+    <section className="grid gap-5">
+      <Panel>
+        <div className="flex flex-col justify-between gap-4 md:flex-row md:items-center">
+          <div>
+            <p className="text-sm font-black uppercase tracking-[0.16em] text-primary">
+              Product Catalog
+            </p>
+            <h2 className="mt-2 text-2xl font-black text-ink">
+              Products and inventory
+            </h2>
+            <p className="mt-2 max-w-2xl text-sm leading-6 text-ink/55">
+              Publish products into categories, track stock, and keep customer
+              facing items ready.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onCreate}
+            className="h-12 rounded-lg bg-primary px-5 text-sm font-black text-white shadow-lg shadow-primary/20 transition hover:bg-[#0b6830]"
+          >
+            Add product
+          </button>
+        </div>
+      </Panel>
+
+      <ProductTable products={products} categories={categories} />
+    </section>
+  );
+}
+
+function OrdersPanel({
+  orders,
+  onUpdateStatus,
+}: {
+  orders: Order[];
+  onUpdateStatus: (orderID: number, status: OrderStatus) => void;
+}) {
+  return <OrderTracker orders={orders} onUpdateStatus={onUpdateStatus} />;
+}
+
+function CategoryDialog({
+  form,
+  isOpen,
+  isSaving,
+  isEditing,
+  onChange,
+  onClose,
+  onSubmit,
+}: {
+  form: typeof emptyCategoryForm;
+  isOpen: boolean;
+  isSaving: boolean;
+  isEditing: boolean;
+  onChange: (value: typeof emptyCategoryForm) => void;
+  onClose: () => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  return (
+    <Dialog
+      isOpen={isOpen}
+      title={isEditing ? "Edit category" : "Create category"}
+      description="Use visual artwork and clean metadata for a storefront-ready category."
+      onClose={onClose}
+    >
+      <form onSubmit={onSubmit} className="grid gap-5">
+        {form.image_url ? (
+          <div
+            className="aspect-[16/7] rounded-xl border border-[#d9e4dc] bg-cover bg-center"
+            style={{ backgroundImage: `url("${form.image_url}")` }}
+            aria-label="Category image preview"
+          />
+        ) : (
+          <div className="flex aspect-[16/7] items-center justify-center rounded-xl border border-dashed border-[#c9d8ce] bg-primary-soft text-sm font-black text-primary">
+            Category image preview
+          </div>
+        )}
+
+        <div className="grid gap-4 sm:grid-cols-2">
+          <TextInput
+            label="Category name"
+            value={form.name}
+            onChange={(value) => onChange({ ...form, name: value })}
+            required
+          />
+          <TextInput
+            label="Display order"
+            type="number"
+            value={form.display_order}
+            onChange={(value) => onChange({ ...form, display_order: value })}
+          />
+          <div className="sm:col-span-2">
+            <TextArea
+              label="Description"
+              value={form.description}
+              onChange={(value) => onChange({ ...form, description: value })}
+            />
+          </div>
+          <TextInput
+            label="Image URL"
+            value={form.image_url}
+            onChange={(value) => onChange({ ...form, image_url: value })}
+          />
+          <TextInput
+            label="Icon URL"
+            value={form.icon_url}
+            onChange={(value) => onChange({ ...form, icon_url: value })}
+          />
+        </div>
+
+        <label className="flex items-center justify-between rounded-lg border border-[#d9e4dc] px-4 py-3 text-sm font-black text-ink/75">
+          <span>Active category</span>
+          <input
+            type="checkbox"
+            checked={form.is_active}
+            onChange={(event) =>
+              onChange({ ...form, is_active: event.target.checked })
+            }
+            className="h-5 w-5 accent-[#0f7a3a]"
+          />
+        </label>
+
+        <DialogActions onClose={onClose}>
+          <PrimaryButton disabled={isSaving}>
+            {isSaving
+              ? "Saving..."
+              : isEditing
+                ? "Update category"
+                : "Create category"}
+          </PrimaryButton>
+        </DialogActions>
+      </form>
+    </Dialog>
+  );
+}
+
+function ProductDialog({
+  categories,
+  form,
+  isOpen,
   isSaving,
   onChange,
+  onClose,
   onSubmit,
 }: {
   categories: Category[];
   form: typeof emptyProductForm;
-  products: Product[];
+  isOpen: boolean;
   isSaving: boolean;
   onChange: (value: typeof emptyProductForm) => void;
+  onClose: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
   return (
-    <section className="grid gap-5 xl:grid-cols-[0.9fr_1.1fr]">
-      <form
-        onSubmit={onSubmit}
-        className="rounded-2xl border border-[#d9e4dc] bg-white p-6 shadow-lg shadow-[#153820]/6"
-      >
-        <h2 className="text-xl font-black text-ink">Add product</h2>
-        <div className="mt-5 grid gap-4 sm:grid-cols-2">
+    <Dialog
+      isOpen={isOpen}
+      title="Create product"
+      description="Add a product with category, inventory, pricing, and a hero image."
+      onClose={onClose}
+    >
+      <form onSubmit={onSubmit} className="grid gap-5">
+        {form.thumbnail_url ? (
+          <div
+            className="aspect-[16/7] rounded-xl border border-[#d9e4dc] bg-cover bg-center"
+            style={{ backgroundImage: `url("${form.thumbnail_url}")` }}
+            aria-label="Product image preview"
+          />
+        ) : (
+          <div className="flex aspect-[16/7] items-center justify-center rounded-xl border border-dashed border-[#c9d8ce] bg-primary-soft text-sm font-black text-primary">
+            Product image preview
+          </div>
+        )}
+
+        <div className="grid gap-4 sm:grid-cols-2">
           <SelectInput
             label="Category"
             value={form.category_id}
@@ -830,39 +1058,111 @@ function ProductsPanel({
               required
             />
           </div>
-          <div className="sm:col-span-2">
-            <PrimaryButton disabled={isSaving}>
-              {isSaving ? "Saving..." : "Create product"}
-            </PrimaryButton>
-          </div>
         </div>
-      </form>
 
-      <ProductCategoryList products={products} />
-    </section>
+        <DialogActions onClose={onClose}>
+          <PrimaryButton disabled={isSaving}>
+            {isSaving ? "Saving..." : "Create product"}
+          </PrimaryButton>
+        </DialogActions>
+      </form>
+    </Dialog>
   );
 }
 
-function OrdersPanel({
-  orders,
-  onUpdateStatus,
+function Dialog({
+  isOpen,
+  title,
+  description,
+  children,
+  onClose,
 }: {
-  orders: Order[];
-  onUpdateStatus: (orderID: number, status: OrderStatus) => void;
+  isOpen: boolean;
+  title: string;
+  description: string;
+  children: React.ReactNode;
+  onClose: () => void;
 }) {
-  return <OrderTracker orders={orders} onUpdateStatus={onUpdateStatus} />;
+  if (!isOpen) {
+    return null;
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/45 px-4 py-6 backdrop-blur-sm">
+      <div className="max-h-[92vh] w-full max-w-2xl overflow-y-auto rounded-2xl border border-[#d9e4dc] bg-white shadow-2xl shadow-black/25">
+        <div className="sticky top-0 z-10 flex items-start justify-between gap-5 border-b border-[#e4ece6] bg-white px-6 py-5">
+          <div>
+            <h2 className="text-2xl font-black text-ink">{title}</h2>
+            <p className="mt-1 text-sm leading-6 text-ink/55">{description}</p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[#d9e4dc] text-xl font-black text-ink/55 transition hover:border-primary/35 hover:text-primary"
+            aria-label="Close dialog"
+            title="Close"
+          >
+            x
+          </button>
+        </div>
+        <div className="p-6">{children}</div>
+      </div>
+    </div>
+  );
 }
 
-function ProductCategoryList({ products }: { products: Product[] }) {
+function DialogActions({
+  children,
+  onClose,
+}: {
+  children: React.ReactNode;
+  onClose: () => void;
+}) {
   return (
-    <div className="rounded-2xl border border-[#d9e4dc] bg-white p-6 shadow-lg shadow-[#153820]/6">
-      <h2 className="text-xl font-black text-ink">Products by category</h2>
+    <div className="grid gap-3 border-t border-[#e4ece6] pt-5 sm:grid-cols-[1fr_1.2fr]">
+      <button
+        type="button"
+        onClick={onClose}
+        className="h-11 rounded-lg border border-[#d9e4dc] px-5 text-sm font-black text-ink/65 transition hover:border-primary/35 hover:text-primary"
+      >
+        Cancel
+      </button>
+      {children}
+    </div>
+  );
+}
+
+function ProductTable({
+  products,
+  categories = [],
+  compact = false,
+}: {
+  products: Product[];
+  categories?: Category[];
+  compact?: boolean;
+}) {
+  const categoryNames = new Map(
+    categories.map((category) => [category.id, category.name]),
+  );
+
+  return (
+    <Panel>
+      <div className="flex items-center justify-between gap-4">
+        <div>
+          <h2 className="text-xl font-black text-ink">
+            {compact ? "Recent products" : "Product catalog"}
+          </h2>
+          <p className="mt-1 text-sm text-ink/55">
+            Product, category, stock, and price at a glance.
+          </p>
+        </div>
+      </div>
       <div className="mt-5 overflow-hidden rounded-xl border border-[#e4ece6]">
         <table className="w-full text-left text-sm">
           <thead className="bg-primary-soft text-primary">
             <tr>
               <th className="px-4 py-3">Product</th>
-              <th className="px-4 py-3">SKU</th>
+              <th className="px-4 py-3">Category</th>
               <th className="px-4 py-3">Stock</th>
               <th className="px-4 py-3">Price</th>
             </tr>
@@ -870,19 +1170,38 @@ function ProductCategoryList({ products }: { products: Product[] }) {
           <tbody className="divide-y divide-[#e4ece6]">
             {products.map((product) => (
               <tr key={product.id}>
-                <td className="px-4 py-3 font-bold text-ink">
-                  {product.title}
+                <td className="px-4 py-3">
+                  <div className="flex items-center gap-3">
+                    <ProductArtwork product={product} />
+                    <div className="min-w-0">
+                      <p className="truncate font-black text-ink">
+                        {product.title}
+                      </p>
+                      <p className="truncate text-xs font-bold text-ink/45">
+                        {product.sku}
+                      </p>
+                    </div>
+                  </div>
                 </td>
-                <td className="px-4 py-3 text-ink/60">{product.sku}</td>
-                <td className="px-4 py-3 text-ink/60">{product.quantity}</td>
                 <td className="px-4 py-3 text-ink/60">
+                  {product.category_id
+                    ? categoryNames.get(product.category_id) ?? "Unmapped"
+                    : "Unmapped"}
+                </td>
+                <td className="px-4 py-3">
+                  <StatusPill
+                    label={String(product.quantity)}
+                    tone={product.quantity <= 10 ? "danger" : "success"}
+                  />
+                </td>
+                <td className="px-4 py-3 font-bold text-ink/70">
                   {currency(product.final_price ?? product.price)}
                 </td>
               </tr>
             ))}
             {!products.length ? (
               <tr>
-                <td className="px-4 py-6 text-ink/55" colSpan={4}>
+                <td className="px-4 py-8 text-center text-ink/55" colSpan={4}>
                   No products found.
                 </td>
               </tr>
@@ -890,7 +1209,7 @@ function ProductCategoryList({ products }: { products: Product[] }) {
           </tbody>
         </table>
       </div>
-    </div>
+    </Panel>
   );
 }
 
@@ -906,8 +1225,11 @@ function OrderTracker({
   const visibleOrders = compact ? orders.slice(0, 5) : orders;
 
   return (
-    <div className="rounded-2xl border border-[#d9e4dc] bg-white p-6 shadow-lg shadow-[#153820]/6">
+    <Panel>
       <h2 className="text-xl font-black text-ink">Customer order tracking</h2>
+      <p className="mt-1 text-sm text-ink/55">
+        Monitor customer orders and move them through fulfillment.
+      </p>
       <div className="mt-5 overflow-hidden rounded-xl border border-[#e4ece6]">
         <table className="w-full text-left text-sm">
           <thead className="bg-primary-soft text-primary">
@@ -921,11 +1243,11 @@ function OrderTracker({
           <tbody className="divide-y divide-[#e4ece6]">
             {visibleOrders.map((order) => (
               <tr key={order.id}>
-                <td className="px-4 py-3 font-bold text-ink">#{order.id}</td>
+                <td className="px-4 py-3 font-black text-ink">#{order.id}</td>
                 <td className="px-4 py-3 text-ink/60">
                   {order.address?.full_name ?? `Customer ${order.customer_id}`}
                 </td>
-                <td className="px-4 py-3 text-ink/60">
+                <td className="px-4 py-3 font-bold text-ink/70">
                   {currency(order.total)}
                 </td>
                 <td className="px-4 py-3">
@@ -947,16 +1269,14 @@ function OrderTracker({
                       ))}
                     </select>
                   ) : (
-                    <span className="rounded-full bg-primary-soft px-3 py-1 text-xs font-bold text-primary">
-                      {order.status}
-                    </span>
+                    <StatusPill label={order.status} tone="success" />
                   )}
                 </td>
               </tr>
             ))}
             {!visibleOrders.length ? (
               <tr>
-                <td className="px-4 py-6 text-ink/55" colSpan={4}>
+                <td className="px-4 py-8 text-center text-ink/55" colSpan={4}>
                   No orders found.
                 </td>
               </tr>
@@ -964,7 +1284,172 @@ function OrderTracker({
           </tbody>
         </table>
       </div>
+    </Panel>
+  );
+}
+
+function CategoryHero({ category }: { category: Category }) {
+  if (category.image_url) {
+    return (
+      <div
+        className="h-36 rounded-t-2xl bg-cover bg-center"
+        style={{ backgroundImage: `url("${category.image_url}")` }}
+        aria-label={`${category.name} category image`}
+      />
+    );
+  }
+
+  return (
+    <div className="flex h-36 items-center justify-center rounded-t-2xl bg-primary-soft text-4xl font-black text-primary">
+      {category.name.slice(0, 1).toUpperCase()}
     </div>
+  );
+}
+
+function CategoryActions({
+  category,
+  categoryView,
+  isOpen,
+  onToggle,
+  onEdit,
+  onDelete,
+  onRestore,
+  onPermanentDelete,
+}: {
+  category: Category;
+  categoryView: CategoryView;
+  isOpen: boolean;
+  onToggle: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+  onRestore: () => void;
+  onPermanentDelete: () => void;
+}) {
+  return (
+    <div className="relative shrink-0">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-ink/55 transition hover:bg-primary-soft hover:text-primary"
+        aria-label={`Open actions for ${category.name}`}
+        title="Actions"
+      >
+        <span className="text-xl leading-none">...</span>
+      </button>
+      {isOpen ? (
+        <div className="absolute right-0 top-10 z-20 w-44 rounded-xl border border-[#d9e4dc] bg-white p-2 text-left shadow-xl shadow-[#153820]/12">
+          {categoryView === "active" ? (
+            <>
+              <ActionMenuButton label="Edit category" onClick={onEdit} />
+              <ActionMenuButton
+                label="Delete category"
+                destructive
+                onClick={onDelete}
+              />
+            </>
+          ) : (
+            <>
+              <ActionMenuButton label="Restore category" onClick={onRestore} />
+              <ActionMenuButton
+                label="Delete forever"
+                destructive
+                onClick={onPermanentDelete}
+              />
+            </>
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ProductArtwork({ product }: { product: Product }) {
+  if (product.thumbnail_url) {
+    return (
+      <div
+        className="h-12 w-12 shrink-0 rounded-xl border border-[#d9e4dc] bg-cover bg-center"
+        style={{ backgroundImage: `url("${product.thumbnail_url}")` }}
+        aria-label={`${product.title} image`}
+      />
+    );
+  }
+
+  return (
+    <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl border border-[#d9e4dc] bg-primary-soft text-base font-black text-primary">
+      {product.title.slice(0, 1).toUpperCase()}
+    </div>
+  );
+}
+
+function ActionMenuButton({
+  label,
+  onClick,
+  destructive = false,
+}: {
+  label: string;
+  onClick: () => void;
+  destructive?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`block h-9 w-full rounded-lg px-3 text-left text-sm font-bold transition ${
+        destructive
+          ? "text-red-700 hover:bg-red-50"
+          : "text-ink/75 hover:bg-primary-soft hover:text-primary"
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
+
+function StatusPill({
+  label,
+  tone,
+}: {
+  label: string;
+  tone: "success" | "danger" | "muted";
+}) {
+  const styles = {
+    success: "bg-primary-soft text-primary",
+    danger: "bg-red-50 text-red-700",
+    muted: "bg-zinc-100 text-zinc-600",
+  };
+
+  return (
+    <span className={`rounded-full px-3 py-1 text-xs font-black ${styles[tone]}`}>
+      {label}
+    </span>
+  );
+}
+
+function Panel({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="rounded-2xl border border-[#dde2e8] bg-white p-6 shadow-[0_10px_24px_rgba(20,30,40,0.06)]">
+      {children}
+    </div>
+  );
+}
+
+function Notice({
+  children,
+  tone,
+}: {
+  children: React.ReactNode;
+  tone: "success" | "error";
+}) {
+  return (
+    <p
+      className={`rounded-xl px-4 py-3 text-sm font-black ${
+        tone === "success"
+          ? "bg-primary-soft text-primary"
+          : "bg-red-50 text-red-700"
+      }`}
+    >
+      {children}
+    </p>
   );
 }
 
